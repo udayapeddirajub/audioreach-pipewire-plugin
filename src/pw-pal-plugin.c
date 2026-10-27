@@ -58,7 +58,6 @@ PW_LOG_TOPIC_STATIC(log_topic, "log:" LOG_TAG);
 #define DEV_INPUT_DIR "/dev/input"
 #define FILE_PREFIX "event"
 #define MAX_DEVICES 4
-#define SVA_DEBUG_DUMP_LOCATION "/tmp"
 #define SVA_SOURCE_BUF_SIZE 512
 #define SVA_SOURCE_BUF_COUNT 8
 #define SVA_BIT_WIDTH 16
@@ -102,7 +101,7 @@ struct sva_runtime {
       bool lab_draining;              // true while draining LAB buffer post-detection
       uint32_t lab_bytes_read;        // bytes drained so far
       uint32_t lab_bytes_total;       // target bytes = lab_duration worth of PCM
-      FILE *lab_dump_fp;              // raw PCM dump of LAB drain, for debug/verification
+      bool lab_status_pending;
 };
 
 
@@ -151,17 +150,12 @@ struct pw_userdata {
     struct sva_config sva_cfg;
     struct sva_runtime sva_rt;    
     
-    struct pw_impl_node *impl_node;
-    struct spa_hook_list hooks;
-    struct spa_interface node_iface;
-    uint32_t props_serial;
-    struct pw_impl_metadata *sva_metadata;   
-    uint32_t sva_node_id;                    
 };
 
 static void sva_set_state(struct pw_userdata *udata, enum sva_state next_state);
 static void sva_emit_props_changed(struct pw_userdata *udata);
 static int close_pal_stream(struct pw_userdata *udata);
+static void sva_schedule_idle_status(struct pw_userdata *udata);
 
 static void pw_pal_destroy_stream(void *d)
 {
@@ -206,90 +200,133 @@ struct sva_detect_ctx {
     uint32_t conf;
     uint64_t kw_start_ms;
     uint64_t kw_end_ms;
+    bool capture_available;
 };
 
-/* Runs on the pw_stream's own loop thread (via pw_loop_invoke below) —
- * pal_stream_callback fires on PAL/GSL's callback thread, and
- * pw_stream_set_param() is not safe to call from any other thread. */
+struct sva_lab_status_ctx { char status[16]; uint64_t bytes; };
+
+static int sva_publish_lab_status_on_loop(struct spa_loop *loop, bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+    struct pw_userdata *udata = user_data;
+    const struct sva_lab_status_ctx *ctx = data;
+    uint8_t pod_buf[256]; struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
+    struct spa_pod_frame f[2]; const struct spa_pod *pod; int rc;
+    (void)loop; (void)async; (void)seq; (void)size;
+    if (!udata || !udata->stream || !ctx) return -EINVAL;
+    spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+    spa_pod_builder_prop(&b, SPA_PROP_params, 0); spa_pod_builder_push_struct(&b, &f[1]);
+    spa_pod_builder_string(&b, "sva.lab.status"); spa_pod_builder_string(&b, ctx->status);
+    spa_pod_builder_string(&b, "sva.lab.bytes"); spa_pod_builder_long(&b, (int64_t)ctx->bytes);
+    spa_pod_builder_pop(&b, &f[1]); pod = spa_pod_builder_pop(&b, &f[0]);
+    if (!pod) return -EINVAL;
+    rc = pw_stream_update_params(udata->stream, &pod, 1);
+    pw_log_warn("[SVA] update_params rc=%d (sva.lab.status=%s)",
+            rc, ctx->status);
+    udata->sva_rt.lab_status_pending = false;
+    if (rc < 0) pw_log_error("[SVA] LAB status publication failed: %s", spa_strerror(rc));
+    return rc;
+}
+
+static void sva_schedule_lab_status(struct pw_userdata *udata, const char *status)
+{
+    struct sva_lab_status_ctx ctx;
+    if (!udata || !udata->context || !status || udata->sva_rt.lab_status_pending) return;
+    memset(&ctx, 0, sizeof(ctx)); snprintf(ctx.status, sizeof(ctx.status), "%s", status);
+    ctx.bytes = udata->sva_rt.lab_bytes_read; udata->sva_rt.lab_status_pending = true;
+    if (pw_loop_invoke(pw_context_get_main_loop(udata->context), sva_publish_lab_status_on_loop, 0, &ctx, sizeof(ctx), false, udata) < 0) {
+        udata->sva_rt.lab_status_pending = false; pw_log_error("[SVA] failed to schedule LAB status=%s", status);
+    }
+}
+
+/*
+ * Publish sva.detection.status=idle and sva.lab.status=idle together.
+ * Called after sva.reset/sva.restart so the node's cached Props never
+ * leave behind a stale "detected"/"complete" value from the previous
+ * cycle for the next subscriber (e.g. a fresh `pw-voiceui listen`) to
+ * replay as if it just happened.
+ */
+static int sva_publish_idle_on_loop(struct spa_loop *loop, bool async,
+                                    uint32_t seq, const void *data,
+                                    size_t size, void *user_data)
+{
+    struct pw_userdata *udata = user_data;
+    uint8_t pod_buf[256]; struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
+    struct spa_pod_frame f[2]; const struct spa_pod *pod; int rc;
+    (void)loop; (void)async; (void)seq; (void)data; (void)size;
+    if (!udata || !udata->stream) return -EINVAL;
+    spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+    spa_pod_builder_prop(&b, SPA_PROP_params, 0); spa_pod_builder_push_struct(&b, &f[1]);
+    spa_pod_builder_string(&b, "sva.detection.status"); spa_pod_builder_string(&b, "idle");
+    spa_pod_builder_string(&b, "sva.lab.status"); spa_pod_builder_string(&b, "idle");
+    spa_pod_builder_pop(&b, &f[1]); pod = spa_pod_builder_pop(&b, &f[0]);
+    if (!pod) return -EINVAL;
+    rc = pw_stream_update_params(udata->stream, &pod, 1);
+    pw_log_warn("[SVA] update_params rc=%d (sva.status=idle)", rc);
+    if (rc < 0) pw_log_error("[SVA] idle status publication failed: %s", spa_strerror(rc));
+    return rc;
+}
+
+static void sva_schedule_idle_status(struct pw_userdata *udata)
+{
+    if (!udata || !udata->context) return;
+    if (pw_loop_invoke(pw_context_get_main_loop(udata->context), sva_publish_idle_on_loop,
+                       0, NULL, 0, false, udata) < 0)
+        pw_log_error("[SVA] failed to schedule idle status");
+}
+
 static int sva_push_detection_on_loop(struct spa_loop *loop, bool async,
-                                       uint32_t seq, const void *data,
-                                       size_t size, void *user_data)
+                                      uint32_t seq, const void *data,
+                                      size_t size, void *user_data);
+static int32_t sva_pal_stream_callback(pal_stream_handle_t *stream_handle,
+                                       uint32_t event_id, uint32_t *event_data,
+                                       uint32_t event_data_size, uint64_t cookie);
+
+static int sva_push_detection_on_loop(struct spa_loop *loop, bool async,
+                                      uint32_t seq, const void *data,
+                                      size_t size, void *user_data)
 {
     struct pw_userdata *udata = user_data;
     const struct sva_detect_ctx *ctx = data;
-    char conf_str[16], kws_str[24], kwe_str[24];
-
-    (void)loop; (void)async; (void)seq; (void)size;
-
-    snprintf(conf_str, sizeof(conf_str), "%u", ctx->conf);
-    snprintf(kws_str, sizeof(kws_str), "%llu", (unsigned long long)ctx->kw_start_ms);
-    snprintf(kwe_str, sizeof(kwe_str), "%llu", (unsigned long long)ctx->kw_end_ms);
-
-    uint8_t buf[512];
+    uint8_t buf[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
     struct spa_pod_frame f[2];
+    int rc;
+
+    (void)loop; (void)async; (void)seq; (void)size;
+    if (!udata || !udata->stream || !ctx)
+        return -EINVAL;
 
     spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
     spa_pod_builder_prop(&b, SPA_PROP_params, 0);
     spa_pod_builder_push_struct(&b, &f[1]);
-    spa_pod_builder_string(&b, "sva.status");          spa_pod_builder_string(&b, "detected");
-    spa_pod_builder_string(&b, "sva.detect.conf");     spa_pod_builder_string(&b, conf_str);
-    spa_pod_builder_string(&b, "sva.detect.kw_start"); spa_pod_builder_string(&b, kws_str);
-    spa_pod_builder_string(&b, "sva.detect.kw_end");   spa_pod_builder_string(&b, kwe_str);
+    spa_pod_builder_string(&b, "sva.detection.status");
+    spa_pod_builder_string(&b, "detected");
+    spa_pod_builder_string(&b, "sva.detection.confidence");
+    spa_pod_builder_int(&b, (int32_t)ctx->conf);
+    spa_pod_builder_string(&b, "sva.detection.kwd_start_ts");
+    spa_pod_builder_long(&b, (int64_t)ctx->kw_start_ms);
+    spa_pod_builder_string(&b, "sva.detection.kwd_end_ts");
+    spa_pod_builder_long(&b, (int64_t)ctx->kw_end_ms);
+    spa_pod_builder_string(&b, "sva.detection.capture_available");
+    spa_pod_builder_bool(&b, ctx->capture_available);
+    if (ctx->capture_available && udata->sva_cfg.lab_enabled) {
+        spa_pod_builder_string(&b, "sva.lab.status");
+        spa_pod_builder_string(&b, "started");
+        spa_pod_builder_string(&b, "sva.lab.bytes");
+        spa_pod_builder_long(&b, 0);
+    }
     spa_pod_builder_pop(&b, &f[1]);
-    const struct spa_pod *pod = spa_pod_builder_pop(&b, &f[0]);
-
-    pw_stream_set_param(udata->stream, SPA_PARAM_Props, pod);
-    pw_log_warn("[SVA] Detection event pushed to client via SPA_PROP_params");
-    return 0;
-}
-
-#define SVA_LAB_READ_CHUNK 4096
-
-/* Actively pull the LAB buffer from PAL, mirroring pal_input_device.cpp's
- * PALInputDevice::Read(): pal_stream_read() is a synchronous, caller-driven
- * pull with no dependency on a connected pw_stream client, so we don't wait
- * for pw_pal_process_stream() to be scheduled by the graph. Called directly
- * on PAL's callback thread right after lab_draining is armed. */
-static void sva_lab_drain_now(struct pw_userdata *udata)
-{
-    uint8_t chunk[SVA_LAB_READ_CHUNK];
-    struct pal_buffer pal_buf;
-    ssize_t rc;
-
-    while (udata->sva_rt.lab_draining &&
-           udata->sva_rt.lab_bytes_read < udata->sva_rt.lab_bytes_total) {
-        uint32_t remaining = udata->sva_rt.lab_bytes_total - udata->sva_rt.lab_bytes_read;
-        uint32_t want = SPA_MIN((uint32_t)sizeof(chunk), remaining);
-
-        memset(&pal_buf, 0, sizeof(pal_buf));
-        pal_buf.buffer = chunk;
-        pal_buf.size = want;
-
-        rc = pal_stream_read(udata->sva_pal_handle, &pal_buf);
-        if (rc < 0) {
-            pw_log_error("[SVA] LAB active pal_stream_read failed: %zd", rc);
-            break;
-        }
-        if (rc == 0)
-            continue;
-
-        if (udata->sva_rt.lab_bytes_read == 0)
-            pw_log_warn("[SVA] LAB active read: first chunk received, %zd bytes", rc);
-
-        if (udata->sva_rt.lab_dump_fp)
-            fwrite(chunk, 1, (size_t)rc, udata->sva_rt.lab_dump_fp);
-
-        udata->sva_rt.lab_bytes_read += (uint32_t)rc;
+    {
+        const struct spa_pod *pod = spa_pod_builder_pop(&b, &f[0]);
+        if (!pod)
+            return -EINVAL;
+        rc = pw_stream_update_params(udata->stream, &pod, 1);
     }
-
-    udata->sva_rt.lab_draining = false;
-    pw_log_warn("[SVA] LAB drain complete: %u bytes", udata->sva_rt.lab_bytes_read);
-    if (udata->sva_rt.lab_dump_fp) {
-        fclose(udata->sva_rt.lab_dump_fp);
-        udata->sva_rt.lab_dump_fp = NULL;
-        pw_log_warn("[SVA] LAB dump: file closed, pull it off-device to verify audio");
-    }
+    if (rc < 0)
+        pw_log_error("[SVA] detection property publication failed: %s", spa_strerror(rc));
+    else
+        pw_log_warn("[SVA] Detection properties published");
+    return rc;
 }
 
 static int32_t sva_pal_stream_callback(pal_stream_handle_t *stream_handle,
@@ -363,35 +400,15 @@ static int32_t sva_pal_stream_callback(pal_stream_handle_t *stream_handle,
           pw_log_warn("[SVA] LAB drain armed: target=%u bytes (%u ms)",
                       udata->sva_rt.lab_bytes_total, udata->sva_cfg.lab_duration);
 
-          if (udata->sva_rt.lab_dump_fp) {
-              fclose(udata->sva_rt.lab_dump_fp);
-              udata->sva_rt.lab_dump_fp = NULL;
-          }
-          char dump_path[320];
-          snprintf(dump_path, sizeof(dump_path), "%s/sva_lab_dump_%ld.pcm",
-                    SVA_DEBUG_DUMP_LOCATION, (long)time(NULL));
-          udata->sva_rt.lab_dump_fp = fopen(dump_path, "wb");
-          if (udata->sva_rt.lab_dump_fp) {
-              pw_log_warn("[SVA] LAB dump: writing raw PCM to %s "
-                          "(rate=%u ch=%u bits=%u)", dump_path,
-                          udata->sva_cfg.sample_rate, udata->sva_cfg.channels,
-                          udata->sva_cfg.bit_width);
-          } else {
-              pw_log_error("[SVA] LAB dump: failed to open %s: %m", dump_path);
-          }
-
-          if (udata->sva_pal_handle)
-              sva_lab_drain_now(udata);
-          else
-              udata->sva_rt.lab_draining = false;
     } else {
           udata->sva_rt.lab_draining = false;
     }
 
     struct sva_detect_ctx ctx = {
-        .conf        = conf,
-        .kw_start_ms = kw_start_ms,
-        .kw_end_ms   = kw_end_ms,
+        .conf              = conf,
+        .kw_start_ms       = kw_start_ms,
+        .kw_end_ms         = kw_end_ms,
+        .capture_available = event->capture_available,
     };
     pw_loop_invoke(pw_context_get_main_loop(udata->context),
                    sva_push_detection_on_loop, 0, &ctx, sizeof(ctx),
@@ -412,6 +429,8 @@ static int sva_set_recognition_config(struct pw_userdata *udata)
     pal_param_payload *rec_payload = calloc(1, sizeof(pal_param_payload) + rc_config_size);
     if (!rec_payload) return -ENOMEM;
 
+    /* Match the original working PAL implementation: the recognition payload
+     * size includes the outer pal_param_payload header. */
     rec_payload->payload_size = sizeof(pal_param_payload) + rc_config_size;
     struct pal_st_recognition_config *rec_cfg =
         (struct pal_st_recognition_config *)rec_payload->payload;
@@ -517,6 +536,10 @@ static int sva_load_sound_model(struct pw_userdata *udata)
         udata->stream_attributes = NULL;
     }
     udata->stream_attributes = calloc(1, sizeof(struct pal_stream_attributes));
+    if (udata->stream_attributes == NULL) {
+        pw_log_error("SVA: failed to allocate stream attributes: %m");
+        return -ENOMEM;
+    }
     struct pal_stream_attributes *stream_attr = udata->stream_attributes;
     memset(stream_attr, 0, sizeof(*stream_attr));
     stream_attr->type                                = PAL_STREAM_VOICE_UI;
@@ -525,7 +548,7 @@ static int sva_load_sound_model(struct pw_userdata *udata)
     stream_attr->direction                           = PAL_AUDIO_INPUT;
     stream_attr->in_media_config.sample_rate         = udata->sva_cfg.sample_rate ? udata->sva_cfg.sample_rate : SVA_SAMPLE_RATE;
     stream_attr->in_media_config.bit_width           = SVA_BIT_WIDTH;
-    stream_attr->in_media_config.aud_fmt_id          = PAL_AUDIO_FMT_DEFAULT_PCM;
+    stream_attr->in_media_config.aud_fmt_id          = PAL_AUDIO_FMT_PCM_S16_LE;
     stream_attr->in_media_config.ch_info.channels    = udata->sva_cfg.channels ? udata->sva_cfg.channels : 1;
     stream_attr->in_media_config.ch_info.ch_map[0]   = PAL_CHMAP_CHANNEL_FL;
 
@@ -536,14 +559,19 @@ static int sva_load_sound_model(struct pw_userdata *udata)
     }
     udata->no_of_devices = 1;
     udata->pal_device = calloc(1, sizeof(struct pal_device));
+    if (udata->pal_device == NULL) {
+        pw_log_error("SVA: failed to allocate PAL device: %m");
+        free(udata->stream_attributes);
+        udata->stream_attributes = NULL;
+        return -ENOMEM;
+    }
     memset(udata->pal_device, 0, sizeof(struct pal_device));
     udata->pal_device->id                      = PAL_DEVICE_IN_HANDSET_VA_MIC;
-    udata->pal_device->config.sample_rate      = PW_DEFAULT_SAMPLE_RATE;
+    udata->pal_device->config.sample_rate      = SVA_SAMPLE_RATE;
     udata->pal_device->config.bit_width        = SVA_BIT_WIDTH;
-    udata->pal_device->config.ch_info.channels = udata->sva_cfg.channels ? udata->sva_cfg.channels : 1;
+    udata->pal_device->config.ch_info.channels = 1;
     udata->pal_device->config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
-    udata->pal_device->config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
-    udata->pal_device->config.aud_fmt_id       = PAL_AUDIO_FMT_DEFAULT_PCM;
+    udata->pal_device->config.aud_fmt_id       = PAL_AUDIO_FMT_PCM_S16_LE;
 
     rc = pal_stream_open(stream_attr, udata->no_of_devices, udata->pal_device,
                         0, NULL,
@@ -610,36 +638,6 @@ static int sva_load_sound_model(struct pw_userdata *udata)
 }
 
 
-/* SPA node methods for SVA — enables spa_node_emit_param_changed */
-
-static int sva_node_add_listener(void *object,
-                                 struct spa_hook *listener,
-                                 const struct spa_node_events *events,
-                                 void *data)
-{
-    struct pw_userdata *udata = object;
-    struct spa_hook_list save;
-    spa_hook_list_isolate(&udata->hooks, &save, listener, events, data);
-   
-    struct spa_param_info param_info[2];
-    param_info[0] = SPA_PARAM_INFO(SPA_PARAM_Props, SPA_PARAM_INFO_READ | SPA_PARAM_INFO_SERIAL);
-    param_info[0].user = udata->props_serial;
-    param_info[1] = SPA_PARAM_INFO(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
-    struct spa_node_info ninfo = SPA_NODE_INFO_INIT();
-    ninfo.max_output_ports = 1;
-    ninfo.change_mask = SPA_NODE_CHANGE_MASK_FLAGS | SPA_NODE_CHANGE_MASK_PARAMS;
-    ninfo.flags = SPA_NODE_FLAG_RT;
-    ninfo.params = param_info;
-    ninfo.n_params = 2;
-
-    spa_node_emit_info(&udata->hooks, &ninfo);
-    spa_hook_list_join(&udata->hooks, &save);
-
-    pw_log_warn("SVA: Node listener added and initial info emitted");
-    return 0;
-}
-
-
 static void sva_emit_props_changed(struct pw_userdata *udata)
 {
     const char *state_names[] = { "idle", "loaded", "active", "detected" };
@@ -658,335 +656,7 @@ static void sva_set_state(struct pw_userdata *udata, enum sva_state next_state)
     pw_log_warn("SVA: [TRANSITION] %s -> %s", 
                 state_names[udata->sva_state], state_names[next_state]);
     udata->sva_state = next_state;
-    if (next_state == SVA_STATE_IDLE)
-        memset(udata->sva_cfg.model_path, 0, sizeof(udata->sva_cfg.model_path));
     sva_emit_props_changed(udata);
-}
-
-static int sva_node_set_param(void *object, uint32_t id,
-                              uint32_t flags, const struct spa_pod *param)
-{
-    struct pw_userdata *udata = object;
-
-    if (id != SPA_PARAM_Props || param == NULL)
-        return 0;
-
-    /* Parse props from POD */
-    struct spa_pod_object *obj = (struct spa_pod_object *)param;
-    struct spa_pod_prop *prop;
-    bool model_path_updated = false;
-
-    SPA_POD_OBJECT_FOREACH(obj, prop) {
-        if (prop->key == SPA_PROP_params) {
-            const struct spa_pod *iter;
-            const struct spa_pod *params_struct = &prop->value;
-
-            if (!spa_pod_is_struct(params_struct))
-                continue;
-
-            SPA_POD_STRUCT_FOREACH(params_struct, iter) {
-                const char *key;
-                if (spa_pod_get_string(iter, &key) < 0)
-                    break;
-
-                const struct spa_pod *value = spa_pod_next(iter);
-                if (!value)
-                    break;
-
-                const char *str_val;
-                int32_t int_val;
-
-                if (spa_streq(key, "sva.sound.model.path") || spa_streq(key, "sva.model.path")) {
-                    if (spa_pod_get_string(value, &str_val) == 0) {
-                        snprintf(udata->sva_cfg.model_path, sizeof(udata->sva_cfg.model_path), "%s", str_val);
-                        model_path_updated = true;
-                    }
-                } else if (spa_streq(key, "sva.confidence.level")) {
-                    if (spa_pod_get_int(value, &int_val) == 0)
-                        udata->sva_cfg.confidence_level = int_val;
-                    else if (spa_pod_get_string(value, &str_val) == 0)
-                        udata->sva_cfg.confidence_level = atoi(str_val);
-                } else if (spa_streq(key, "sva.lab.duration")) {
-                    if (spa_pod_get_int(value, &int_val) == 0)
-                        udata->sva_cfg.lab_duration = int_val;
-                    else if (spa_pod_get_string(value, &str_val) == 0)
-                        udata->sva_cfg.lab_duration = atoi(str_val);
-                } else if (spa_streq(key, "sva.lab.enabled")) {
-                    if (spa_pod_get_string(value, &str_val) == 0)
-                        udata->sva_cfg.lab_enabled = spa_streq(str_val, "true");
-                } else if (spa_streq(key, "sva.mode")) {
-                    if (spa_pod_get_string(value, &str_val) == 0)
-                        snprintf(udata->sva_cfg.mode, sizeof(udata->sva_cfg.mode), "%s", str_val);
-                } else if (spa_streq(key, "sva.reset")) {
-                      bool val = false;
-                      if (spa_pod_get_bool(value, &val) == 0 && val) {
-                          pw_log_warn("SVA: sva.reset requested — releasing PAL resources");
-                          close_pal_stream(udata);
-                          sva_set_state(udata, SVA_STATE_IDLE);
-                          return 0;
-                      }
-                } else if (spa_streq(key, "sva.restart")) {
-                      bool val = false;
-                      if (spa_pod_get_bool(value, &val) == 0 && val) {
-                          if (udata->sva_pal_handle &&
-                              (udata->sva_state == SVA_STATE_DETECTED ||
-                               udata->sva_state == SVA_STATE_ACTIVE)) {
-                              pw_log_warn("SVA: sva.restart requested — restarting "
-                                          "recognition, model stays loaded");
-                              int rc = pal_stream_start(udata->sva_pal_handle);
-                              if (rc == 0) {
-                                  sva_set_state(udata, SVA_STATE_ACTIVE);
-                                  pw_log_warn("SVA: Recognition RESTARTED");
-                              } else {
-                                  pw_log_error("SVA: sva.restart FAILED rc=%d", rc);
-                              }
-                          } else {
-                              pw_log_warn("SVA: sva.restart requested but no model "
-                                          "loaded (state=%d) — ignoring", udata->sva_state);
-                          }
-                          return 0;
-                      }
-                }
-
-                iter = value;
-            }
-        }
-    }
-
-    pw_log_warn("SVA: ===== Props received (via spa_node) =====");
-    pw_log_warn("SVA:   model.path       = %s",
-                udata->sva_cfg.model_path[0] ? udata->sva_cfg.model_path : "(not set)");
-    pw_log_warn("SVA:   confidence.level = %u", udata->sva_cfg.confidence_level);
-    pw_log_warn("SVA:   lab.enabled      = %d", udata->sva_cfg.lab_enabled);
-    pw_log_warn("SVA:   lab.duration     = %u", udata->sva_cfg.lab_duration);
-    pw_log_warn("SVA:   mode             = %s", udata->sva_cfg.mode);
-    pw_log_warn("SVA: ==========================================");
-
-    if (model_path_updated && udata->sva_cfg.model_path[0] != '\0' &&
-        udata->sva_state != SVA_STATE_IDLE) {
-        pw_log_warn("SVA: New model path received while active (state=%d) — "
-                    "releasing previous session before reload", udata->sva_state);
-        close_pal_stream(udata);
-        sva_set_state(udata, SVA_STATE_IDLE);
-    }
-
-    if (udata->sva_state == SVA_STATE_IDLE && udata->sva_cfg.model_path[0] != '\0') {
-        int rc = sva_load_sound_model(udata);
-        if (rc != 0) {
-            pw_log_error("SVA: Model load FAILED (rc=%d), staying IDLE", rc);
-            sva_emit_props_changed(udata);
-            return rc;
-        }
-        sva_set_state(udata, SVA_STATE_LOADED);
-        pw_log_warn("SVA: Sound model LOADED to ADSP successfully");
-                 /* ──── Recognition Config with Opaque Data ──── */
-        
-        {
-            uint32_t num_phrases = 1;
-
-            uint32_t opaque_size = sizeof(struct st_param_header) +
-                                sizeof(struct st_confidence_levels_info_v2) +
-                                sizeof(struct st_param_header) +
-                                sizeof(struct st_hist_buffer_info);
-
-            uint32_t rc_config_size = sizeof(struct pal_st_recognition_config) + opaque_size;
-
-            pal_param_payload *rec_payload = calloc(1,
-                sizeof(pal_param_payload) + rc_config_size);
-            if (!rec_payload) {
-                pw_log_error("SVA: OOM for rec config");
-                pal_stream_close(udata->sva_pal_handle);
-                udata->sva_pal_handle = NULL;
-                return -ENOMEM;
-            }
-            
-            rec_payload->payload_size = sizeof(pal_param_payload) + rc_config_size;
-
-            struct pal_st_recognition_config *rec_cfg =
-                (struct pal_st_recognition_config *)rec_payload->payload;
-
-            rec_cfg->capture_handle    = 0;
-            rec_cfg->capture_device    = PAL_DEVICE_IN_HANDSET_VA_MIC;
-            rec_cfg->capture_requested = udata->sva_cfg.lab_enabled ? 1 : 0;
-            rec_cfg->num_phrases       = num_phrases;
-            rec_cfg->data_size         = opaque_size;
-            rec_cfg->data_offset       = sizeof(struct pal_st_recognition_config);
-            rec_cfg->callback          = NULL;
-            rec_cfg->cookie            = (uint8_t *)udata;
-
-            /* phrase[0]: id=1, num_levels=0 */
-            rec_cfg->phrases[0].id               = SVA_PHRASE_ID;
-            rec_cfg->phrases[0].recognition_modes = PAL_RECOGNITION_MODE_VOICE_TRIGGER;
-            rec_cfg->phrases[0].confidence_level  = udata->sva_cfg.confidence_level;
-            rec_cfg->phrases[0].num_levels        = 0;  /* no user verification */
-
-            /* Opaque: confidence levels */
-            uint8_t *payload_ptr = (uint8_t *)rec_cfg + rec_cfg->data_offset;
-
-            struct st_param_header *hdr = (struct st_param_header *)payload_ptr;
-            hdr->key_id       = ST_PARAM_KEY_CONFIDENCE_LEVELS;
-            hdr->payload_size = sizeof(struct st_confidence_levels_info_v2);
-            payload_ptr += sizeof(struct st_param_header);
-
-            struct st_confidence_levels_info_v2 *conf_info =
-                (struct st_confidence_levels_info_v2 *)payload_ptr;
-            conf_info->version          = ST_CONFIG_VERSION_V2;
-            conf_info->num_sound_models = SVA_NUM_SOUND_MODELS;  /* GMM + PDK + USER */
-
-            /* GMM */
-            conf_info->conf_levels[0].sm_id         = ST_SM_ID_SVA_F_STAGE_GMM;
-            conf_info->conf_levels[0].num_kw_levels = num_phrases;
-            conf_info->conf_levels[0].kw_levels[0].kw_level       = (int32_t)udata->sva_cfg.confidence_level;
-            conf_info->conf_levels[0].kw_levels[0].num_user_levels = 0;
-
-            /* PDK */
-            conf_info->conf_levels[1].sm_id         = ST_SM_ID_SVA_S_STAGE_PDK;
-            conf_info->conf_levels[1].num_kw_levels = num_phrases;
-            conf_info->conf_levels[1].kw_levels[0].kw_level       = SVA_PDK_CONFIDENCE_LEVEL;
-            conf_info->conf_levels[1].kw_levels[0].num_user_levels = 0;
-
-            /* USER */
-            conf_info->conf_levels[2].sm_id         = ST_SM_ID_SVA_S_STAGE_USER;
-            conf_info->conf_levels[2].num_kw_levels = num_phrases;
-            conf_info->conf_levels[2].kw_levels[0].kw_level       = 0;
-            conf_info->conf_levels[2].kw_levels[0].num_user_levels = 0;
-
-            payload_ptr += sizeof(struct st_confidence_levels_info_v2);
-
-            /* Opaque: history buffer */
-            hdr = (struct st_param_header *)payload_ptr;
-            hdr->key_id       = ST_PARAM_KEY_HISTORY_BUFFER_CONFIG;
-            hdr->payload_size = sizeof(struct st_hist_buffer_info);
-            payload_ptr += sizeof(struct st_param_header);
-
-            struct st_hist_buffer_info *hist = (struct st_hist_buffer_info *)payload_ptr;
-            hist->version                   = ST_CONFIG_VERSION_V2;
-            hist->hist_buffer_duration_msec = SVA_HIST_BUFFER_DURATION_MSEC;
-            hist->pre_roll_duration_msec    = SVA_PREROLL_DURATION_MSEC;
-
-            pw_log_warn("SVA: RecConfig: conf=%u lab=%d hist=%dms num_models=%d phrase_id=%d",
-                        udata->sva_cfg.confidence_level, udata->sva_cfg.lab_enabled,
-                        SVA_HIST_BUFFER_DURATION_MSEC, SVA_NUM_SOUND_MODELS, SVA_PHRASE_ID);
-
-            rc = pal_stream_set_param(udata->sva_pal_handle,
-                                    PAL_PARAM_ID_RECOGNITION_CONFIG,
-                                    rec_payload);
-            free(rec_payload);
-            if (rc != 0) {
-                pw_log_error("SVA: RECOGNITION_CONFIG FAILED rc=%d", rc);
-                pal_stream_close(udata->sva_pal_handle);
-                udata->sva_pal_handle = NULL;
-                return rc;
-            }
-            pw_log_warn("SVA: Recognition config set successfully");
-        }
-        /* ──── END Recognition Config ──── */
-        /* 5. Start recognition — arms DSP for keyword detection */
-        pw_log_warn("SVA: pal_stream_start enter");
-        rc = pal_stream_start(udata->sva_pal_handle);
-        if (rc != 0) {
-            pw_log_error("SVA: pal_stream_start FAILED rc=%d", rc);
-            pal_stream_close(udata->sva_pal_handle);
-            udata->sva_pal_handle = NULL;
-            return rc;
-        }
-        sva_set_state(udata, SVA_STATE_ACTIVE);
-        pw_log_warn("SVA: Recognition STARTED — listening for keyword");
-        return 0;
-    }
-
-    sva_emit_props_changed(udata);
-
-    return 0;
-}
-
-static int sva_node_enum_params(void *object, int seq,
-                                uint32_t id, uint32_t start, uint32_t num,
-                                const struct spa_pod *filter)
-{
-    struct pw_userdata *udata = object;
-    uint8_t buf[1024];
-    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-    struct spa_result_node_params result;
-
-    result.id = id;
-    result.next = start;
-
-    if (id == SPA_PARAM_Props && start == 0) {
-        struct spa_pod_frame f[2];
-
-        spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
-        spa_pod_builder_prop(&b, SPA_PROP_params, 0);
-        spa_pod_builder_push_struct(&b, &f[1]);
-            spa_pod_builder_string(&b, "sva.state");
-            switch (udata->sva_state) {
-            case SVA_STATE_IDLE:    spa_pod_builder_string(&b, "idle"); break;
-            case SVA_STATE_LOADED:  spa_pod_builder_string(&b, "loaded"); break;
-            case SVA_STATE_ACTIVE:  spa_pod_builder_string(&b, "active"); break;
-            case SVA_STATE_DETECTED: spa_pod_builder_string(&b, "detected"); break;
-            default:                spa_pod_builder_string(&b, "unknown"); break;
-            }
-            spa_pod_builder_string(&b, "sva.model.path");
-            spa_pod_builder_string(&b, udata->sva_cfg.model_path[0]
-                                        ? udata->sva_cfg.model_path : "(none)");
-            spa_pod_builder_string(&b, "sva.confidence.level");
-            spa_pod_builder_int(&b, udata->sva_cfg.confidence_level);
-            spa_pod_builder_string(&b, "sva.mode");
-            spa_pod_builder_string(&b, udata->sva_cfg.mode);
-        spa_pod_builder_pop(&b, &f[1]);
-        result.param = spa_pod_builder_pop(&b, &f[0]);
-        result.next++;
-        spa_node_emit_result(&udata->hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, &result);
-    }
-
-    if (id == SPA_PARAM_EnumFormat && start == 0) {
-        result.param = spa_format_audio_raw_build(&b, id, &(struct spa_audio_info_raw) {
-            .format = SPA_AUDIO_FORMAT_S16_LE,
-            .rate = udata->sva_cfg.sample_rate,
-            .channels = udata->sva_cfg.channels,
-            .position = { SPA_AUDIO_CHANNEL_MONO },
-        });
-        result.next++;
-        spa_node_emit_result(&udata->hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, &result);
-    }
-
-    return 0;
-}
-
-static const struct spa_node_methods sva_node_impl = {
-    SPA_VERSION_NODE_METHODS,
-    .add_listener = sva_node_add_listener,
-    .set_param = sva_node_set_param,
-    .enum_params = sva_node_enum_params,
-};
-
-static int sva_create_impl_node(struct pw_userdata *udata)
-{
-    struct pw_properties *node_props;
-    spa_hook_list_init(&udata->hooks);
-    node_props = pw_properties_new(
-        PW_KEY_NODE_NAME, "pal_source_voice_ui",
-        PW_KEY_NODE_DESCRIPTION, "PAL SVA Voice Activation",
-        PW_KEY_MEDIA_CLASS, "Audio/Source/Virtual",
-        "node.autoconnect", "false",
-        "priority.session", "0",
-        PW_KEY_MEDIA_ROLE, "VoiceUI",
-        PW_KEY_NODE_VIRTUAL, "true",
-        NULL);
-    udata->impl_node = pw_context_create_node(udata->context, node_props, 0);
-    udata->node_iface = SPA_INTERFACE_INIT(SPA_TYPE_INTERFACE_Node, SPA_VERSION_NODE, &sva_node_impl, udata);
-    pw_impl_node_set_implementation(udata->impl_node, (struct spa_node *)&udata->node_iface);
-    pw_impl_node_register(udata->impl_node, NULL);
-    /* Initialize IDs and Metadata */
-    udata->sva_node_id = pw_global_get_id(pw_impl_node_get_global(udata->impl_node));
-    udata->sva_metadata = pw_context_create_metadata(udata->context, "sva.events", NULL, 0);
-    if (udata->sva_metadata) {
-        pw_impl_metadata_register(udata->sva_metadata, NULL);
-        /* Push initial IDLE state to metadata bus */
-        sva_emit_props_changed(udata);
-    }
-    pw_log_warn("SVA: Node (id=%u) and Metadata registered", udata->sva_node_id);
-    return 0;
 }
 
 static int close_pal_stream(struct pw_userdata *udata)
@@ -999,13 +669,6 @@ static int close_pal_stream(struct pw_userdata *udata)
             udata->sva_pal_handle = NULL;
         }
         udata->sva_rt.lab_draining = false;
-        if (udata->sva_rt.lab_dump_fp) {
-            fclose(udata->sva_rt.lab_dump_fp);
-            udata->sva_rt.lab_dump_fp = NULL;
-            pw_log_warn("[SVA] LAB dump: file closed (stream torn down "
-                        "mid-drain, %u/%u bytes captured)",
-                        udata->sva_rt.lab_bytes_read, udata->sva_rt.lab_bytes_total);
-        }
         return 0;
     }
 
@@ -1107,58 +770,92 @@ static void pw_pal_change_stream_state(void *d, enum pw_stream_state old,
 static void pw_pal_process_stream(void *d)
 {
     struct pw_userdata *udata = d;
-    struct pw_buffer *buf;
+    struct pw_buffer *buf = pw_stream_dequeue_buffer(udata->stream);
     struct spa_data *bd;
-    void *data;
-    uint32_t offs, size;
-    struct pal_buffer pal_buf;
-    int rc = 0;
-    static int tmp = 0;
+    struct pal_buffer pal_buf = { 0 };
+    uint32_t size = 0;
+    const char *lab_status = NULL;
+    int rc;
 
-    if ((buf = pw_stream_dequeue_buffer(udata->stream)) == NULL) {
-        pw_log_error("out of buffers: %m");
-        return;
-    }
-
+    if (!buf) { pw_log_error("out of buffers: %m"); return; }
+    if (!buf->buffer || buf->buffer->n_datas == 0) goto queue;
     bd = &buf->buffer->datas[0];
-    memset(&pal_buf, 0, sizeof(struct pal_buffer));
+    if (!bd->chunk || !bd->data) goto queue;
+
     if (udata->isplayback) {
-        offs = SPA_MIN(bd->chunk->offset, bd->maxsize);
-        size = SPA_MIN(bd->chunk->size, bd->maxsize - offs);
-        data = SPA_PTROFF(bd->data, offs, void);
-
-        pal_buf.buffer = data;
+        uint32_t off = SPA_MIN(bd->chunk->offset, bd->maxsize);
+        size = SPA_MIN(bd->chunk->size, bd->maxsize - off);
+        pal_buf.buffer = SPA_PTROFF(bd->data, off, void);
         pal_buf.size = size;
-
-        if (udata->stream_handle) {
-            if ((rc = pal_stream_write(udata->stream_handle, &pal_buf)) < 0) {
-                pw_log_error("Could not write data: %d %d", rc, __LINE__);
-            }
-        }
+        if (udata->stream_handle && (rc = pal_stream_write(udata->stream_handle, &pal_buf)) < 0)
+            pw_log_error("Could not write data: %d", rc);
     } else {
-          data = bd->data;
-          size = buf->requested ? buf->requested * udata->frame_size : bd->maxsize;
-
-          pal_buf.buffer = data;
-          pal_buf.size = size;
-
-          if (udata->stream_handle && !udata->is_sva) {
-              if ((rc = pal_stream_read(udata->stream_handle, &pal_buf)) < 0) {
-                  pw_log_error("Could not read data: %d %d", rc, __LINE__);
-                  size = 0;
-              }
-          } else {
-              size = 0;
-          }
-
-          bd->chunk->size = size;
-          bd->chunk->stride = udata->frame_size;
-          bd->chunk->offset = 0;
-          buf->size = udata->frame_size ? size / udata->frame_size : 0;
+        size = buf->requested ? SPA_MIN(buf->requested * udata->frame_size, bd->maxsize) : bd->maxsize;
+        pal_buf.buffer = bd->data;
+        pal_buf.size = size;
+        if (udata->is_sva) {
+            if (udata->sva_rt.lab_draining && udata->sva_pal_handle) {
+                pw_log_warn("[SVA] PipeWire process entered");
+                {
+                    uint32_t remaining = udata->sva_rt.lab_bytes_total -
+                                         udata->sva_rt.lab_bytes_read;
+                    pal_buf.size = SPA_MIN(pal_buf.size, remaining);
+                }
+                rc = pal_stream_read(udata->sva_pal_handle, &pal_buf);
+                if (rc < 0) {
+                    pw_log_error("[SVA] LAB read failed: %d", rc);
+                    size = 0;
+                    udata->sva_rt.lab_draining = false;
+                    lab_status = "error";
+                } else if (rc == 0) {
+                    pw_log_warn("[SVA] LAB read returned zero bytes; stopping drain");
+                    size = 0;
+                    udata->sva_rt.lab_draining = false;
+                    lab_status = "error";
+                } else {
+                    size = (uint32_t)rc;
+                    udata->sva_rt.lab_bytes_read += size;
+                    if (udata->sva_rt.lab_bytes_read >= udata->sva_rt.lab_bytes_total)
+                        udata->sva_rt.lab_draining = false;
+                    pw_log_warn("[SVA] LAB progress=%u/%u", udata->sva_rt.lab_bytes_read, udata->sva_rt.lab_bytes_total);
+                    if (!udata->sva_rt.lab_draining) {
+                        /* Queue this buffer first; status is published afterwards. */
+                        lab_status = "complete";
+                        pw_log_warn("[SVA] LAB complete=%u", udata->sva_rt.lab_bytes_read);
+                    }
+                }
+            } else size = 0;
+        } else if (udata->stream_handle) {
+            if ((rc = pal_stream_read(udata->stream_handle, &pal_buf)) < 0) {
+                pw_log_error("Could not read data: %d", rc); size = 0;
+            } else size = (uint32_t)rc;
+        }
+        bd->chunk->offset = 0;
+        bd->chunk->size = size;
+        bd->chunk->stride = udata->frame_size;
+        buf->size = udata->frame_size ? size / udata->frame_size : 0;
     }
+queue:
+    rc = pw_stream_queue_buffer(udata->stream, buf);
+    if (rc < 0) {
+        pw_log_error("pw_stream_queue_buffer failed: %s", spa_strerror(rc));
+    } else if (lab_status) {
+        sva_schedule_lab_status(udata, lab_status);
+    }
+}
 
-    /* write buffer contents here */
-    pw_stream_queue_buffer(udata->stream, buf);
+static int sva_start_recognition(struct pw_userdata *udata)
+{
+    int rc = sva_load_sound_model(udata);
+    if (rc != 0) return rc;
+    sva_set_state(udata, SVA_STATE_LOADED);
+    rc = sva_set_recognition_config(udata);
+    if (rc != 0) { close_pal_stream(udata); sva_set_state(udata, SVA_STATE_IDLE); return rc; }
+    rc = pal_stream_start(udata->sva_pal_handle);
+    if (rc != 0) { close_pal_stream(udata); sva_set_state(udata, SVA_STATE_IDLE); return rc; }
+    sva_set_state(udata, SVA_STATE_ACTIVE);
+    pw_log_warn("[SVA] Recognition STARTED");
+    return 0;
 }
 
 static void pw_pal_change_stream_param(void *data, uint32_t id, const struct spa_pod *param) {
@@ -1192,16 +889,22 @@ static void pw_pal_change_stream_param(void *data, uint32_t id, const struct spa
                             model_path_updated = true;
                         }
                     } else if (spa_streq(key, "sva.confidence.level")) {
-                        if (spa_pod_get_int(value, &int_val) == 0)
-                            udata->sva_cfg.confidence_level = int_val;
-                        else if (spa_pod_get_string(value, &str_val) == 0)
-                            udata->sva_cfg.confidence_level = atoi(str_val);
+                        if (spa_pod_get_int(value, &int_val) == 0 && int_val >= 0 && int_val <= 100)
+                            udata->sva_cfg.confidence_level = (uint32_t)int_val;
+                        else if (spa_pod_get_string(value, &str_val) == 0) {
+                            char *end; long v = strtol(str_val, &end, 10);
+                            if (*str_val && *end == '\0' && v >= 0 && v <= 100)
+                                udata->sva_cfg.confidence_level = (uint32_t)v;
+                            else { pw_log_error("SVA: invalid confidence level"); return; }
+                        }
                     } else if (spa_streq(key, "sva.lab.duration")) {
-                        if (spa_pod_get_int(value, &int_val) == 0)
-                            udata->sva_cfg.lab_duration = int_val;
+                        if (spa_pod_get_int(value, &int_val) == 0 && int_val > 0)
+                            udata->sva_cfg.lab_duration = (uint32_t)int_val;
+                        else { pw_log_error("SVA: invalid LAB duration"); return; }
                     } else if (spa_streq(key, "sva.lab.enabled")) {
-                        if (spa_pod_get_string(value, &str_val) == 0)
-                            udata->sva_cfg.lab_enabled = spa_streq(str_val, "true");
+                        bool bool_val;
+                        if (spa_pod_get_bool(value, &bool_val) == 0)
+                            udata->sva_cfg.lab_enabled = bool_val;
                     } else if (spa_streq(key, "sva.mode")) {
                         if (spa_pod_get_string(value, &str_val) == 0)
                             snprintf(udata->sva_cfg.mode, sizeof(udata->sva_cfg.mode), "%s", str_val);
@@ -1210,7 +913,9 @@ static void pw_pal_change_stream_param(void *data, uint32_t id, const struct spa
                        if (spa_pod_get_bool(value, &val) == 0 && val) {
                           pw_log_warn("SVA: sva.reset requested — releasing PAL resources");
                           close_pal_stream(udata);
+                          udata->sva_cfg.model_path[0] = '\0';
                           sva_set_state(udata, SVA_STATE_IDLE);
+                          sva_schedule_idle_status(udata);
                           return;
                         }
                    } else if (spa_streq(key, "sva.restart")) {
@@ -1224,6 +929,7 @@ static void pw_pal_change_stream_param(void *data, uint32_t id, const struct spa
                               int rc = pal_stream_start(udata->sva_pal_handle);
                               if (rc == 0) {
                                   sva_set_state(udata, SVA_STATE_ACTIVE);
+                                  sva_schedule_idle_status(udata);
                                   pw_log_warn("SVA: Recognition RESTARTED");
                               } else {
                                   pw_log_error("SVA: sva.restart FAILED rc=%d", rc);
@@ -1252,23 +958,11 @@ static void pw_pal_change_stream_param(void *data, uint32_t id, const struct spa
             close_pal_stream(udata);
             sva_set_state(udata, SVA_STATE_IDLE);
         }
-        if (udata->sva_state == SVA_STATE_IDLE && udata->sva_cfg.model_path[0] != '\0') {
-            int rc = sva_load_sound_model(udata);
-            if (rc == 0) {
-                sva_set_state(udata, SVA_STATE_LOADED);
-                rc = sva_set_recognition_config(udata);
-                if (rc != 0) {
-                    pw_log_error("SVA: RECOGNITION_CONFIG FAILED rc=%d", rc);
-                    pal_stream_close(udata->sva_pal_handle);
-                    udata->sva_pal_handle = NULL;
-                    return;
-                }
-                rc = pal_stream_start(udata->sva_pal_handle);
-                if (rc == 0) {
-                    sva_set_state(udata, SVA_STATE_ACTIVE);
-                    pw_log_warn("SVA: Recognition STARTED");
-                }
-            }
+        if (model_path_updated && udata->sva_state == SVA_STATE_IDLE &&
+            udata->sva_cfg.model_path[0] != '\0') {
+            int rc = sva_start_recognition(udata);
+            if (rc != 0)
+                pw_log_error("SVA: recognition start failed rc=%d", rc);
         }
         return;
     }
@@ -1354,13 +1048,15 @@ static int pw_pal_create_stream(struct pw_userdata *udata)
               PW_STREAM_FLAG_AUTOCONNECT |
               PW_STREAM_FLAG_NO_CONVERT |
               PW_STREAM_FLAG_MAP_BUFFERS |
-              PW_STREAM_FLAG_RT_PROCESS,
+              (udata->is_sva ? 0 : PW_STREAM_FLAG_RT_PROCESS),
               params, n_params);
-
+    if (res < 0) {
+        pw_log_error("pw_stream_connect failed: %s", spa_strerror(res));
+        return res;
+    }
     if (udata->is_offload)
         pw_stream_set_active(udata->stream, true);
-
-   return 0;
+    return 0;
 }
 
 static void pw_pal_core_error(void *data, uint32_t id, int seq, int res, const char *message)
@@ -1397,14 +1093,6 @@ static void pw_pal_userdata_destroy(struct pw_userdata *udata)
     if (udata->sva_cfg.model_data) {
         free(udata->sva_cfg.model_data);
         udata->sva_cfg.model_data = NULL;
-    }
-    if (udata->sva_metadata) {
-        pw_impl_metadata_destroy(udata->sva_metadata);
-        udata->sva_metadata = NULL;
-    }
-    if (udata->impl_node) {
-        pw_impl_node_destroy(udata->impl_node);
-        udata->impl_node = NULL;
     }
     
     if (udata->stream)
@@ -1558,9 +1246,10 @@ static size_t pw_stream_get_buffer_size(struct pw_userdata *udata, struct pal_me
 
         return (length/udata->frame_size) * udata->frame_size;
 }
-static void pw_pal_fill_stream_info(struct pw_userdata *udata)
+static int pw_pal_fill_stream_info(struct pw_userdata *udata)
 {
     udata->stream_attributes = calloc(1, sizeof(struct pal_stream_attributes));
+    if (!udata->stream_attributes) { pw_log_error("failed to allocate PAL stream attributes"); return -ENOMEM; }
     udata->stream_attributes->type  = udata->stream_type;
     udata->stream_attributes->flags = 0;
     if (!udata->is_sva) {
@@ -1629,6 +1318,12 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
 
     if (udata->pal_device) free(udata->pal_device);
     udata->pal_device = calloc(udata->no_of_devices, sizeof(struct pal_device));
+    if (!udata->pal_device) {
+    pw_log_error("failed to allocate PAL devices");
+    free(udata->stream_attributes);
+    udata->stream_attributes = NULL;
+    return -ENOMEM;
+}
 
     for (int i = 0; i < udata->no_of_devices; i++) {
         udata->pal_device[i].id = udata->pal_device_id[i];
@@ -1641,14 +1336,13 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
             udata->pal_device[i].config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
             udata->pal_device[i].config.aud_fmt_id = PAL_AUDIO_FMT_PCM_S16_LE;
         } else {
-            udata->pal_device[i].config.sample_rate = PW_DEFAULT_SAMPLE_RATE;
+            udata->pal_device[i].config.sample_rate = SVA_SAMPLE_RATE;
             udata->pal_device[i].config.bit_width = SVA_BIT_WIDTH;
-            udata->pal_device[i].config.ch_info.channels = PW_DEFAULT_SAMPLE_CHANNELS;
+            udata->pal_device[i].config.ch_info.channels = 1;
             udata->pal_device[i].config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
-            udata->pal_device[i].config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
             udata->pal_device[i].config.aud_fmt_id = PAL_AUDIO_FMT_PCM_S16_LE;
         }
-    }
+    } return 0;
 }
 
 static inline bool pw_stream_is_running(struct pw_userdata *udata)
@@ -1712,6 +1406,7 @@ static int handle_device_connection(struct pw_userdata *udata, bool state)
         }
         return 0;
     }
+    return 0;
 }
 
 
@@ -1874,6 +1569,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     udata = calloc(1, sizeof(struct pw_userdata));
     if (udata == NULL)
         return -errno;
+    udata->jack_fd = -1;
     if (args == NULL)
         args = "";
 
@@ -2062,15 +1758,15 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
         else
             snprintf(udata->sva_cfg.mode, sizeof(udata->sva_cfg.mode), "NLPI");
         if ((str = pw_properties_get(props, "sva.sample.rate")) != NULL)
-            udata->sva_cfg.sample_rate = atoi(str);
+            udata->sva_cfg.sample_rate = SVA_SAMPLE_RATE;
         else
             udata->sva_cfg.sample_rate = SVA_SAMPLE_RATE;
         if ((str = pw_properties_get(props, "sva.channels")) != NULL)
-            udata->sva_cfg.channels = atoi(str);
+            udata->sva_cfg.channels = 1;
         else
             udata->sva_cfg.channels = 1;
         if ((str = pw_properties_get(props, "sva.bit.width")) != NULL)
-            udata->sva_cfg.bit_width = atoi(str);
+            udata->sva_cfg.bit_width = SVA_BIT_WIDTH;
         else
             udata->sva_cfg.bit_width = SVA_BIT_WIDTH;
         pw_log_info("SVA config: model=%s confidence=%u mode=%s sr=%u ch=%u",
@@ -2079,47 +1775,31 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
                     udata->sva_cfg.mode,
                     udata->sva_cfg.sample_rate,
                     udata->sva_cfg.channels);
-        /* Create pw_stream for SVA (same as other source nodes) */
-        pw_pal_fill_stream_info(udata);
+        /* Create the SVA PipeWire stream with the fixed V1 format. */
+        udata->info.format = SPA_AUDIO_FORMAT_S16_LE;
+        udata->info.rate = SVA_SAMPLE_RATE;
+        udata->info.channels = 1;
+        udata->info.position[0] = SPA_AUDIO_CHANNEL_MONO;
+        udata->frame_size = SVA_FRAME_SIZE_BYTES;
+        if ((res = pw_pal_fill_stream_info(udata)) < 0)
+            goto error;
         if ((res = pw_pal_create_stream(udata)) < 0)
             goto error;
         pw_impl_module_add_listener(module, &udata->module_listener,
                                     &pw_pal_events_module, udata);
         /* Auto-load model if path provided in module args */
         if (udata->sva_state == SVA_STATE_IDLE && udata->sva_cfg.model_path[0] != '\0') {
-            int rc = sva_load_sound_model(udata);
-            if (rc != 0) {
-                pw_log_error("SVA: Model load failed rc=%d, waiting for pw-voiceui", rc);
-                return 0;  /* module alive, stream registered, retry via param_changed */
-            }
-            sva_set_state(udata, SVA_STATE_LOADED);
-            pw_log_warn("SVA: Sound model LOADED to ADSP successfully");
-            rc = sva_set_recognition_config(udata);
-            if (rc != 0) {
-                pw_log_error("SVA: RECOGNITION_CONFIG FAILED rc=%d", rc);
-                pal_stream_close(udata->sva_pal_handle);
-                udata->sva_pal_handle = NULL;
-                return 0;
-            }
-            
-            /* ──── END Recognition Config ──── */
-            /* Start recognition */
-            rc = pal_stream_start(udata->sva_pal_handle);
-            if (rc != 0) {
-                pw_log_error("SVA: pal_stream_start FAILED rc=%d", rc);
-                pal_stream_close(udata->sva_pal_handle);
-                udata->sva_pal_handle = NULL;
-                return 0;
-            }
-            sva_set_state(udata, SVA_STATE_ACTIVE);
-            pw_log_warn("SVA: Recognition STARTED — listening for keyword");
+            int rc = sva_start_recognition(udata);
+            if (rc != 0)
+                pw_log_error("SVA: auto recognition start failed rc=%d", rc);
         } else {
             pw_log_warn("SVA: No model path — waiting for runtime trigger via pw-voiceui");
         }
         return 0;   
     }
 
-    pw_pal_fill_stream_info(udata);
+    if ((res = pw_pal_fill_stream_info(udata)) < 0)
+        goto error;
     if ((res = pw_pal_create_stream(udata)) < 0)
         goto error;
     pw_impl_module_add_listener(module, &udata->module_listener, &pw_pal_events_module, udata);
